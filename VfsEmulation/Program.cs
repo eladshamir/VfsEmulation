@@ -1,4 +1,4 @@
-﻿using DiscUtils;
+using DiscUtils;
 using DiscUtils.Fat;
 using Microsoft.Win32;
 using System;
@@ -125,7 +125,7 @@ namespace VfsEmulation
             }
         }
 
-        static void SaveVFStoDisk(byte[] bytes, string filepath, string regpath)
+        static void SaveVFStoDisk(byte[] bytes, string filepath, string regpath, bool hidden = true)
         {
             try
             {
@@ -142,6 +142,10 @@ namespace VfsEmulation
                 // Write the encrypted VFS to disk
                 Console.WriteLine("[*] Writing VFS to {0}", filepath);
                 File.WriteAllBytes(filepath, encryptedVfsBytes);
+                if (hidden)
+                {
+                    File.SetAttributes(filepath, File.GetAttributes(filepath) | FileAttributes.Hidden);
+                }
                 Console.WriteLine("[+] Successfully wrote VFS to {0}", filepath);
             }
             catch (Exception ex)
@@ -150,9 +154,9 @@ namespace VfsEmulation
             }
         }
 
-        static void SaveVFStoDisk(MemoryStream stream, string filepath, string regpath)
+        static void SaveVFStoDisk(MemoryStream stream, string filepath, string regpath, bool hidden = true)
         {
-            SaveVFStoDisk(stream.ToArray(), filepath, regpath);
+            SaveVFStoDisk(stream.ToArray(), filepath, regpath, hidden);
         }
 
         static FatFileSystem OpenVFS(MemoryStream stream, string filepath, string regpath)
