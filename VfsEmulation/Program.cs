@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
+using System.IO.Compression;
 
 namespace VfsEmulation
 {
@@ -104,6 +105,28 @@ namespace VfsEmulation
             return true;
         }
 
+        static byte[] Compress(byte[] data)
+        {
+            using (var compressedStream = new MemoryStream())
+            using (var zipStream = new GZipStream(compressedStream, CompressionMode.Compress))
+            {
+                zipStream.Write(data, 0, data.Length);
+                zipStream.Close();
+                return compressedStream.ToArray();
+            }
+        }
+
+        static byte[] Decompress(byte[] data)
+        {
+            using (var compressedStream = new MemoryStream(data))
+            using (var zipStream = new GZipStream(compressedStream, CompressionMode.Decompress))
+            using (var resultStream = new MemoryStream())
+            {
+                zipStream.CopyTo(resultStream);
+                return resultStream.ToArray();
+            }
+        }
+
         static void InitializeVFS(string filepath, string regpath, string label, long capacity)
         {
             try
@@ -125,10 +148,17 @@ namespace VfsEmulation
             }
         }
 
-        static void SaveVFStoDisk(byte[] bytes, string filepath, string regpath, bool hidden = true)
+        static void SaveVFStoDisk(byte[] bytes, string filepath, string regpath, bool hidden = true, bool compress = true)
         {
             try
             {
+                // Compress the VFS before encrypting it
+                if (compress)
+                {
+                    Console.WriteLine("[*] Compressing the data");
+                    bytes = Compress(bytes);
+                }
+
                 // Obtain key from Registry or generate a new one
                 Console.WriteLine("[*] Obtaining an encryption key");
                 byte[] key;
@@ -141,7 +171,10 @@ namespace VfsEmulation
 
                 // Write the encrypted VFS to disk
                 Console.WriteLine("[*] Writing VFS to {0}", filepath);
-                File.WriteAllBytes(filepath, encryptedVfsBytes);
+                using (FileStream fs = new FileStream(filepath, FileMode.OpenOrCreate))
+                {
+                    fs.Write(encryptedVfsBytes, 0, encryptedVfsBytes.Length);
+                }
                 if (hidden)
                 {
                     File.SetAttributes(filepath, File.GetAttributes(filepath) | FileAttributes.Hidden);
@@ -154,12 +187,12 @@ namespace VfsEmulation
             }
         }
 
-        static void SaveVFStoDisk(MemoryStream stream, string filepath, string regpath, bool hidden = true)
+        static void SaveVFStoDisk(MemoryStream stream, string filepath, string regpath, bool hidden = true, bool compress = true)
         {
-            SaveVFStoDisk(stream.ToArray(), filepath, regpath, hidden);
+            SaveVFStoDisk(stream.ToArray(), filepath, regpath, hidden, compress);
         }
 
-        static FatFileSystem OpenVFS(MemoryStream stream, string filepath, string regpath)
+        static FatFileSystem OpenVFS(MemoryStream stream, string filepath, string regpath, bool compress = true)
         {
             try
             {
@@ -181,7 +214,16 @@ namespace VfsEmulation
 
                 // Load the VFS
                 Console.WriteLine("[*] Loading the VFS");
+
+                // Decompress the VFS before decrypting it
+                if (compress)
+                {
+                    vfsBytes = Decompress(vfsBytes);
+                }
+
                 stream.Write(vfsBytes, 0, vfsBytes.Length);
+
+                // Construct the VFS
                 FatFileSystem fatFileSystem = new FatFileSystem(stream);
 
                 if (fatFileSystem == null)
