@@ -11,4 +11,5 @@ This project helps emulate the following TTPs:
 * Modify Registry ([T1112](https://attack.mitre.org/techniques/T1112/)).
 * Obfuscated Files or Information ([T1027](https://attack.mitre.org/techniques/T1027/)).
 * Hide Artifacts: Hidden Files and Directories ([T1564.001](https://attack.mitre.org/techniques/T1564/001/)).
+* Hide Artifacts: NTFS File Attributes ([T1564.004](https://attack.mitre.org/techniques/T1564/004/)).
 * Archive Collected Data: Archive via Library ([T1560.002](https://attack.mitre.org/techniques/T1560/002/)).
