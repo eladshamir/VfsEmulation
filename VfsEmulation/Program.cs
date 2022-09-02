@@ -7,11 +7,56 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using System.IO.Compression;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace VfsEmulation
 {
     internal class Program
     {
+        [Flags]
+        public enum EFileAccess : uint
+        {
+            GenericRead = 0x80000000,
+            GenericWrite = 0x40000000,
+            GenericExecute = 0x20000000,
+            GenericAll = 0x10000000
+        }
+
+        [Flags]
+        public enum EFileShare : uint
+        {
+            None = 0x00000000,
+            Read = 0x00000001,
+            Write = 0x00000002,
+            Delete = 0x00000004
+        }
+
+        public enum ECreationDisposition : uint
+        {
+            New = 1,
+            CreateAlways = 2,
+            OpenExisting = 3,
+            OpenAlways = 4,
+            TruncateExisting = 5
+        }
+
+        [Flags]
+        public enum EFileAttributes : uint
+        {
+            Normal = 0x00000080
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern SafeFileHandle CreateFile(
+           string lpFileName,
+           EFileAccess dwDesiredAccess,
+           EFileShare dwShareMode,
+           IntPtr lpSecurityAttributes,
+           ECreationDisposition dwCreationDisposition,
+           EFileAttributes dwFlagsAndAttributes,
+           IntPtr hTemplateFile);
+
         public static byte[] Encrypt(byte[] data, byte[] key, byte[] iv)
         {
             using (var aes = Aes.Create())
@@ -68,20 +113,90 @@ namespace VfsEmulation
             return ms.ToArray();
         }
 
-        static bool GetKey(string regpath, out byte[] key, out byte[] iv)
+        static bool GetKey(string keypath, out byte[] key, out byte[] iv, bool ads)
+        {
+            if (ads)
+            {
+                return GetKeyFromADS(keypath, out key, out iv);
+            }
+            else
+            {
+                return GetKeyFromRegistry(keypath, out key, out iv);
+            }    
+        }
+
+        static bool GetKeyFromADS(string keypath, out byte[] key, out byte[] iv)
         {
             key = new byte[32];
             iv = new byte[16];
             byte[] b = new byte[48];
 
-            string keyName = regpath.Substring(0, regpath.LastIndexOf('\\'));
-            string valueName = regpath.Substring(regpath.LastIndexOf('\\') + 1);
+            string fileName = keypath.Substring(0, keypath.LastIndexOf(':'));
+            string streamName = keypath.Substring(keypath.LastIndexOf(':') + 1);
+
+            var sfh = CreateFile(keypath,
+                    EFileAccess.GenericRead | EFileAccess.GenericWrite,
+                    EFileShare.Read,
+                    IntPtr.Zero,
+                    ECreationDisposition.OpenExisting,
+                    EFileAttributes.Normal,
+                    IntPtr.Zero);
+            if (sfh.IsInvalid)
+            {
+                Console.WriteLine("[!] Could not fine alternative data stream {0}{1}[*] Generating new key", keypath, Environment.NewLine);
+
+                var rnd = new RNGCryptoServiceProvider();
+                rnd.GetNonZeroBytes(b);
+
+                sfh = CreateFile(keypath,
+                    EFileAccess.GenericRead | EFileAccess.GenericWrite,
+                    EFileShare.Read,
+                    IntPtr.Zero,
+                    ECreationDisposition.CreateAlways,
+                    EFileAttributes.Normal,
+                    IntPtr.Zero);
+                if (sfh.IsInvalid)
+                {
+                    throw new Exception(String.Format("Failed to create file {0}", keypath));
+                }
+
+                using (FileStream fs = new FileStream(sfh, FileAccess.Write))
+                {
+                    fs.Write(b, 0, b.Length);
+                }
+
+                sfh.Close();
+            }
+            else
+            {
+                using (FileStream fs = new FileStream(sfh, FileAccess.Read))
+                {
+                    fs.Read(b, 0, b.Length);
+                }
+                sfh.Close();
+                Console.WriteLine("[+] Retrieved the key from alternative data stream {0}", keypath);
+            }
+
+            Array.Copy(b, 0, key, 0, 32);
+            Array.Copy(b, 32, iv, 0, 16);
+
+            return true;
+        }
+
+        static bool GetKeyFromRegistry(string keypath, out byte[] key, out byte[] iv)
+        {
+            key = new byte[32];
+            iv = new byte[16];
+            byte[] b = new byte[48];
+
+            string keyName = keypath.Substring(0, keypath.LastIndexOf('\\'));
+            string valueName = keypath.Substring(keypath.LastIndexOf('\\') + 1);
 
             RegistryKey registryKey = Registry.CurrentUser.OpenSubKey(keyName, true);
             object value = null;
             if (registryKey == null)
             {
-                Console.WriteLine("[X] Could not open Registry key {0}", keyName);
+                Console.WriteLine("[!] Could not open Registry key {0}", keyName);
                 return false;
             }
 
@@ -127,7 +242,7 @@ namespace VfsEmulation
             }
         }
 
-        static void InitializeVFS(string filepath, string regpath, string label, long capacity)
+        static void InitializeVFS(string filepath, string keypath, string label, long capacity, bool ads)
         {
             try
             {
@@ -140,7 +255,7 @@ namespace VfsEmulation
                 }
                 Console.WriteLine("[+] VFS Created");
 
-                SaveVFStoDisk(vfsBytes, filepath, regpath);
+                SaveVFStoDisk(vfsBytes, filepath, keypath, ads);
             }
             catch (Exception ex)
             {
@@ -148,7 +263,7 @@ namespace VfsEmulation
             }
         }
 
-        static void SaveVFStoDisk(byte[] bytes, string filepath, string regpath, bool hidden = true, bool compress = true)
+        static void SaveVFStoDisk(byte[] bytes, string filepath, string keypath, bool ads, bool hidden = true, bool compress = true)
         {
             try
             {
@@ -163,7 +278,7 @@ namespace VfsEmulation
                 Console.WriteLine("[*] Obtaining an encryption key");
                 byte[] key;
                 byte[] iv;
-                GetKey(regpath, out key, out iv);
+                GetKey(keypath, out key, out iv, ads);
 
                 // Encrypt the VFS
                 Console.WriteLine("[*] Encrypting the VFS");
@@ -187,12 +302,12 @@ namespace VfsEmulation
             }
         }
 
-        static void SaveVFStoDisk(MemoryStream stream, string filepath, string regpath, bool hidden = true, bool compress = true)
+        static void SaveVFStoDisk(MemoryStream stream, string filepath, string keypath, bool hidden = true, bool compress = true)
         {
-            SaveVFStoDisk(stream.ToArray(), filepath, regpath, hidden, compress);
+            SaveVFStoDisk(stream.ToArray(), filepath, keypath, hidden, compress);
         }
 
-        static FatFileSystem OpenVFS(MemoryStream stream, string filepath, string regpath, bool compress = true)
+        static FatFileSystem OpenVFS(MemoryStream stream, string filepath, string keypath, bool ads, bool compress = true)
         {
             try
             {
@@ -202,7 +317,7 @@ namespace VfsEmulation
                 Console.WriteLine("[*] Obtaining the decryption key");
                 byte[] key;
                 byte[] iv;
-                GetKey(regpath, out key, out iv);
+                GetKey(keypath, out key, out iv, ads);
 
                 // Read encrypted VFS from disk
                 Console.WriteLine("[*] Reading VFS from {0}", filepath);
@@ -280,41 +395,48 @@ namespace VfsEmulation
   
   The encryption key is store in Registry in a user-specified key under HKCU.
 
-  Usage: VfsEmulation.exe <command> /filepath:<path to VFS file> /regpath:<Registry path for encryption key>
+  Usage: VfsEmulation.exe <command> /filepath:<path to VFS file> /keypath:<Registry path for encryption key> [/ads]
   </additional command-specific arguments>
+
+  The /ads flag instructs the program to load/save the key to a file/alternative data stream instead of the Registry
 
   Commands
     init            Create a new virtual file system and write it to file
         Optional Arguments:
             /capacity:    The capacity of the virtual partition in bytes
             /label:       The label of the partition
-        Example:
-            VfsEmulation.exe init /filepath:iecache.bin /regpath:""SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\Order"" /capacity:8634368 /label:VFS
+        Examples:
+            VfsEmulation.exe init /filepath:iecache.bin /keypath:""SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\Order"" /capacity:8634368 /label:VFS
+            VfsEmulation.exe init /filepath:iecache.bin /ads /keypath:""%TEMP%\KB943729.log:{1DC12691-2B24-2265-435D-735D3B118A70}"" /capacity:8634368 /label:VFS
 
     mkdir           Create a new directory
         Required Arguments:
             /targetpath:  The name of the new directory (full path, e.g., loot\documents)
-        Example:
-            VfsEmulation.exe mkdir /filepath:iecache.bin /regpath:""SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\Order"" /targetpath:loot
+        Examples:
+            VfsEmulation.exe mkdir /filepath:iecache.bin /keypath:""SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\Order"" /targetpath:loot
+            VfsEmulation.exe mkdir /filepath:iecache.bin /ads /keypath:""%TEMP%\KB943729.log:{1DC12691-2B24-2265-435D-735D3B118A70}"" /targetpath:loot
 
     add             Add a file to the VFS
         Required Arguments:
             /targetpath:  The path of the new file on the VFS
             /sourcefile:  Either a Base64-encoded blob or the path of the file to be add
-        Example:
-            VfsEmulation.exe add /filepath:iecache.bin /regpath:""SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\Order"" /targetpath:loot\credentials\passwords.txt /sourcefile:C:\Users\Administrator\Desktop\passwords.txt
+        Examples:
+            VfsEmulation.exe add /filepath:iecache.bin /keypath:""SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\Order"" /targetpath:loot\credentials\passwords.txt /sourcefile:C:\Users\Administrator\Desktop\passwords.txt
+            VfsEmulation.exe add /filepath:iecache.bin /ads /keypath:""%TEMP%\KB943729.log:{1DC12691-2B24-2265-435D-735D3B118A70}"" /targetpath:loot\credentials\passwords.txt /sourcefile:C:\Users\Administrator\Desktop\passwords.txt
 
     removefile      Remove a file from the VFS
         Required Arguments:
             /targetpath:  The path of the file to remove
-        Example:
-            VfsEmulation.exe removefile /filepath:iecache.bin /regpath:""SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\Order"" /targetpath:loot\credentials\passwords.txt
+        Examples:
+            VfsEmulation.exe removefile /filepath:iecache.bin /keypath:""SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\Order"" /targetpath:loot\credentials\passwords.txt
+            VfsEmulation.exe removefile /filepath:iecache.bin /ads /keypath:""%TEMP%\KB943729.log:{1DC12691-2B24-2265-435D-735D3B118A70}"" /targetpath:loot\credentials\passwords.txt
 
     removedir      Remove a directory from the VFS
         Required Arguments:
             /targetpath:  The path of the directory to remove
-        Example:
-            VfsEmulation.exe removefile /filepath:iecache.bin /regpath:""SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\Order"" /targetpath:loot\credentials
+        Examples:
+            VfsEmulation.exe removefile /filepath:iecache.bin /keypath:""SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\Order"" /targetpath:loot\credentials
+            VfsEmulation.exe removefile /filepath:iecache.bin /ads /keypath:""%TEMP%\KB943729.log:{1DC12691-2B24-2265-435D-735D3B118A70}"" /targetpath:loot\credentials
 
     open            Retrieve a file from the VFS
         Required Arguments:
@@ -322,14 +444,16 @@ namespace VfsEmulation
         Optional Arguments:
             /outfile:     The path where the file will be saved
             If outfile is note provided, the file will be printed to stdout as a Base64-encoded blob
-        Example:
-            VfsEmulation.exe open /filepath:iecache.bin /regpath:""SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\Order"" /targetpath:loot\credentials\passwords.txt
+        Examples:
+            VfsEmulation.exe open /filepath:iecache.bin /keypath:""SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\Order"" /targetpath:loot\credentials\passwords.txt
+            VfsEmulation.exe open /filepath:iecache.bin /ads /keypath:""%TEMP%\KB943729.log:{1DC12691-2B24-2265-435D-735D3B118A70}"" /targetpath:loot\credentials\passwords.txt
     
     list            List the contents of a directory
         Required Arguments:
             /targetpath:  The path of the direcotry to list
-        Example:
-            VfsEmulation.exe list /filepath:iecache.bin /regpath:""SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\Order"" /targetpath:loot\credentials
+        Examples:
+            VfsEmulation.exe list /filepath:iecache.bin /keypath:""SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{59031A47-3F72-44A7-89C5-5595FE6B30EE}\Order"" /targetpath:loot\credentials
+            VfsEmulation.exe list /filepath:iecache.bin /ads /keypath:""%TEMP%\KB943729.log:{1DC12691-2B24-2265-435D-735D3B118A70}"" /targetpath:loot\credentials
 
 ";
             Console.WriteLine(usage);
@@ -380,13 +504,14 @@ namespace VfsEmulation
                 }
 
                 string filepath;
-                string regpath;
+                string keypath;
                 long capacity;
                 long minCapacity = 4317184;
                 string targetpath;
                 string sourcefile;
                 string outfile = null;
                 string label = "";
+                bool ads = false;
                 MemoryStream stream = new MemoryStream();
 
                 if (!arguments.ContainsKey("filepath") || String.IsNullOrEmpty(arguments["filepath"]))
@@ -398,13 +523,17 @@ namespace VfsEmulation
                     filepath = arguments["filepath"];
                 }
 
-                if (!arguments.ContainsKey("regpath") || String.IsNullOrEmpty(arguments["regpath"]))
+                if (!arguments.ContainsKey("keypath") || String.IsNullOrEmpty(arguments["keypath"]))
                 {
-                    throw new Exception("/regpath is required and must contain the Registry path of the encryption keys.\r\n");
+                    throw new Exception("/keypath is required and must contain the Registry path of the encryption keys.\r\n");
                 }
                 else
                 {
-                    regpath = arguments["regpath"];
+                    keypath = arguments["keypath"];
+                }
+                if (arguments.ContainsKey("ads"))
+                {
+                    ads = true;
                 }
 
                 // Initialize a new VFS
@@ -433,7 +562,7 @@ namespace VfsEmulation
                     }
 
                     Console.WriteLine("[*] Initializing a new VFS");
-                    InitializeVFS(filepath, regpath, label, capacity);
+                    InitializeVFS(filepath, keypath, label, capacity, ads);
                     Console.WriteLine("[+] VFS successfully initialized");
                 }
 
@@ -447,11 +576,11 @@ namespace VfsEmulation
                     else
                     {
                         targetpath = arguments["targetpath"];
-                        FatFileSystem vfs = OpenVFS(stream, filepath, regpath);
+                        FatFileSystem vfs = OpenVFS(stream, filepath, keypath, ads);
                         Console.WriteLine("[*] Creating the new directory: {0}", targetpath);
                         vfs.CreateDirectory(targetpath);
                         Console.WriteLine("[+] Directory successfully created: {0}", targetpath);
-                        SaveVFStoDisk(stream.ToArray(), filepath, regpath);
+                        SaveVFStoDisk(stream.ToArray(), filepath, keypath, ads);
                     }
                 }
 
@@ -488,14 +617,14 @@ namespace VfsEmulation
                             throw new Exception("Failed to open source file");
                         }
 
-                        FatFileSystem vfs = OpenVFS(stream, filepath, regpath);
+                        FatFileSystem vfs = OpenVFS(stream, filepath, keypath, ads);
                         Console.WriteLine("[*] Adding file to VFS");
                         using (Stream s = vfs.OpenFile(targetpath, FileMode.Create))
                         {
                             s.Write(sourcebytes, 0, sourcebytes.Length);
                         }
                         Console.WriteLine("[+] File successfully written to {0}", targetpath);
-                        SaveVFStoDisk(stream.ToArray(), filepath, regpath);                       
+                        SaveVFStoDisk(stream.ToArray(), filepath, keypath, ads);                       
                     }
                 }
 
@@ -511,11 +640,11 @@ namespace VfsEmulation
                         targetpath = arguments["targetpath"];
                     }
 
-                    FatFileSystem vfs = OpenVFS(stream, filepath, regpath);
+                    FatFileSystem vfs = OpenVFS(stream, filepath, keypath, ads);
                     Console.WriteLine("[*] Removing file from VFS");
                     vfs.DeleteFile(targetpath);
                     Console.WriteLine("[+] File successfully removed: {0}", targetpath);
-                    SaveVFStoDisk(stream.ToArray(), filepath, regpath);
+                    SaveVFStoDisk(stream.ToArray(), filepath, keypath, ads );
                 }
 
                 // Remove a directory from the VFS
@@ -530,11 +659,11 @@ namespace VfsEmulation
                         targetpath = arguments["targetpath"];
                     }
 
-                    FatFileSystem vfs = OpenVFS(stream, filepath, regpath);
+                    FatFileSystem vfs = OpenVFS(stream, filepath, keypath, ads);
                     Console.WriteLine("[*] Removing directory from VFS");
                     vfs.DeleteDirectory(targetpath);
                     Console.WriteLine("[+] Directory successfully removed: {0}", targetpath);
-                    SaveVFStoDisk(stream.ToArray(), filepath, regpath);
+                    SaveVFStoDisk(stream.ToArray(), filepath, keypath, ads);
                 }
 
                 // Open a file from the VFS
@@ -554,7 +683,7 @@ namespace VfsEmulation
                         outfile = arguments["outfile"];
                     }
 
-                    FatFileSystem vfs = OpenVFS(stream, filepath, regpath);
+                    FatFileSystem vfs = OpenVFS(stream, filepath, keypath, ads);
                     MemoryStream ms = new MemoryStream();
                     using (Stream s = vfs.OpenFile(targetpath, FileMode.Open))
                     {
@@ -592,7 +721,7 @@ namespace VfsEmulation
                         targetpath = arguments["targetpath"];
                     }
 
-                    FatFileSystem vfs = OpenVFS(stream, filepath, regpath);
+                    FatFileSystem vfs = OpenVFS(stream, filepath, keypath, ads);
                     Console.WriteLine("[*] Listing directory {0}:", targetpath);
                     ListDirectory(vfs, targetpath);
                 }
